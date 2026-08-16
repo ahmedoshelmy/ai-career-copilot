@@ -1,0 +1,15 @@
+# AI Career Copilot - Part 01: Chat Foundation
+# Minimal, focused dependencies
+
+# LangChain & LLM integrations
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0
+langchain-ollama>=0.2.0
+
+# Data validation & settings
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Interactive UI
+gradio>=4.0.0
