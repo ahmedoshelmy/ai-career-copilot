@@ -1,15 +1,25 @@
-# AI Career Copilot - Part 01: Chat Foundation
-# Minimal, focused dependencies
+# AI Career Copilot — Session 02: Ingestion & Matching Dependencies
 
-# LangChain & LLM integrations
+# LangChain & Ecosystem
 langchain>=0.3.0
 langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+
+# LLM & Embeddings Providers
 langchain-groq>=0.2.0
 langchain-ollama>=0.2.0
+langchain-huggingface>=0.1.0
+sentence-transformers>=3.0.0
 
-# Data validation & settings
+# Vector Store & Document Parsing
+langchain-chroma>=0.1.4
+chromadb>=0.5.0
+pypdf>=4.0.0
+
+# Data Validation & Environment
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 
-# Interactive UI
+# Interactive Web Application
 gradio>=4.0.0

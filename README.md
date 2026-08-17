@@ -1,49 +1,66 @@
-# 🧭 AI Career Copilot
+# 🧭 AI Career Copilot — Session 02: Resume & Job Ingestion
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![LangChain](https://img.shields.io/badge/LangChain-v0.3+-green.svg)](https://python.langchain.com/)
+[![Chroma](https://img.shields.io/badge/VectorStore-Chroma-red.svg)](https://docs.trychroma.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-An intelligent, real-time **AI Career Coach & Copilot** built with LangChain Expression Language (LCEL), Pydantic structured output validation, and an interactive Gradio web interface.
+An intelligent, end-to-end **AI Career Coach & Job Matcher** powered by LangChain, HuggingFace embeddings, Chroma vector search, and structured Pydantic skill-gap analysis.
 
 ---
 
-## 🎯 Features & Architecture
+## 🎯 What's New in Session 02
 
-- ⚡ **Real-Time Token Streaming**: Low-latency token streaming using LCEL chains (`chain.stream()`).
-- 📋 **Dynamic Profile Extraction**: Automatically parses conversation history into structured `CandidateProfile` Pydantic models (target role, years of experience, top skills, current situation).
-- 💡 **Targeted Career Advisory Engine**: Dedicated structured chain generating actionable advice (`CareerAdvice`) with step-by-step action items and recommended resources.
-- 🖥️ **Interactive Gradio Web UI**: Clean interface with live streaming chat, dynamic candidate profile card, and model settings.
-- 🔌 **Multi-Provider Support**: Default support for ultra-fast Groq models, with support for local/cloud Ollama models.
+Session 02 upgrades the copilot from a basic conversational assistant into a full **Document Ingestion & Semantic Matching Engine**:
+
+- 📄 **Multi-Format Resume Ingestion**: Ingest candidate resumes directly from raw text, `.txt`, or `.pdf` documents using `TextLoader` and `PyPDFLoader`.
+- 🏢 **Batch Job Description Loading**: Automatically ingest and parse directories of job postings with `DirectoryLoader` and metadata tagging (title, company).
+- ✂️ **Smart Text Chunking**: Segment documents into optimal retrieval blocks using `RecursiveCharacterTextSplitter`.
+- 🧠 **Serverless Embeddings**: Embed documents into high-dimensional semantic vectors using `HuggingFaceEndpointEmbeddings` (`all-MiniLM-L6-v2`).
+- 🗄️ **Chroma Vector Store**: Index and rank job postings by semantic similarity using Chroma vector search (`similarity_search_with_score`).
+- 🔍 **Structured Skill-Gap Analysis**: Run deterministic LLM evaluations (`SkillGapAnalysis`) comparing candidate experience against job requirements, highlighting matched skills, missing skills, fit summary, and actionable tips.
+- 🖥️ **Interactive Gradio v2 UI**: Features drag-and-drop resume upload, batch job file uploads, interactive ranking bars, and a live coaching chat window.
+
+---
+
+## 🏗️ Architecture
 
 ```
-User Message
-     │
-     ▼
-ChatPromptTemplate (System Coach Persona + Conversational History)
-     │
-     ▼
-ChatGroq / ChatOllama (Token Streaming)
-     │
-     ├─────────────────────────────────────────┐
-     ▼                                         ▼
-StrOutputParser (Live Streamed Response)     with_structured_output(CandidateProfile)
-     │                                         │
-     ▼                                         ▼
-Gradio Chat UI                            Candidate Profile Sidebar Card
+Candidate Resume (.pdf / .txt / text)          Job Postings (.txt directory)
+              │                                                │
+       TextLoader / PyPDFLoader                         DirectoryLoader
+              │                                                │
+       RecursiveCharacterTextSplitter                   RecursiveCharacterTextSplitter
+              │                                                │
+       embed_query()                                    HuggingFaceEndpointEmbeddings
+              │                                                │
+              └────────────────► Chroma Vector Index ◄─────────┘
+                                       │
+                               similarity_search_with_score()
+                                       │
+                                       ▼
+                              Top-N Ranked Job Matches
+                                       │
+                                       ▼
+                       LLM Structured Skill-Gap Analysis
+                      (Matched, Missing, Summary, Action Tips)
 ```
 
 ---
 
-## 🛠️ Step-by-Step Build Guide (`starter.py`)
+## 🛠️ Step-by-Step Implementation Guide (`starter.py`)
 
-The core logic lives in `starter.py`. Follow the guided `# TODO` comments to build each component:
+The core logic lives in `starter.py`. Follow the guided `# TODO` items in order:
 
-1. **`build_chat_chain(llm)`**: Compose `system_prompt | llm | StrOutputParser()`.
-2. **`stream_reply(chain, history, question)`**: Stream output tokens progressively from `chain.stream()`.
-3. **`extract_profile(llm, conversation)`**: Use `llm.with_structured_output(CandidateProfile)` to extract key profile data.
-4. **`answer_career_question(llm, role, question)`**: Build a specialized one-shot chain returning structured `CareerAdvice`.
-5. **`run_demo()`**: Connect all components for a simulated multi-turn career coaching interview.
+| Step | Function | Goal |
+|---|---|---|
+| **TODO 1** | `load_resume(source)` | Load resume from PDF, TXT file, or raw text string into a LangChain `Document`. |
+| **TODO 2** | `load_job_postings(directory)` | Load all job `.txt` files from a directory using `DirectoryLoader` with metadata. |
+| **TODO 3** | `chunk_documents(docs)` | Chunk documents with `RecursiveCharacterTextSplitter(chunk_size=500, overlap=50)`. |
+| **TODO 4** | `build_job_vectorstore(job_docs)` | Embed and index job documents into a Chroma vector store. |
+| **TODO 5** | `find_best_matches(vectorstore, resume)` | Compute similarity scores (`1 / (1 + distance) * 100`) and return ranked `JobMatch` list. |
+| **TODO 6** | `analyze_skill_gap(llm, resume, job)` | Structured comparison of candidate resume vs. target job returning `SkillGapAnalysis`. |
+| **TODO 7** | `run_copilot_v2(resume, jobs_dir)` | Orchestrate the complete end-to-end ingestion and analysis pipeline. |
 
 ---
 
@@ -63,8 +80,8 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Environment Variables
-Copy `.env.example` to `.env` and set your Groq API key (free at [console.groq.com](https://console.groq.com/keys)):
+### 3. Configure API Keys
+Copy `.env.example` to `.env` and provide your API keys:
 
 ```bash
 cp .env.example .env
@@ -72,19 +89,23 @@ cp .env.example .env
 
 Edit `.env`:
 ```env
-GROQ_API_KEY=gsk_your_actual_api_key_here
+# Fast free inference: https://console.groq.com/keys
+GROQ_API_KEY=gsk_your_groq_api_key_here
 GROQ_MODEL=openai/gpt-oss-20b
+
+# Free embeddings: https://huggingface.co/settings/tokens
+HUGGING_FACE_API_KEY=hf_your_huggingface_token_here
 ```
 
 ### 4. Run the Project
 
-#### Interactive Gradio Web App
+#### Interactive Web Application
 ```bash
 python app.py
 ```
-Open [http://localhost:7860](http://localhost:7860) in your browser. As you complete TODOs in `starter.py`, reload the app to see your features come alive!
+Open [http://localhost:7860](http://localhost:7860) in your browser. As you implement TODOs in `starter.py`, the web interface updates dynamically!
 
-#### CLI Hands-On Runner
+#### CLI Hands-On Practice Runner
 ```bash
 python starter.py
 ```
@@ -95,27 +116,42 @@ python starter.py
 
 ```
 ai-career-copilot/
-├── app.py               # Interactive Gradio web interface (imports from starter.py)
-├── starter.py           # Practice scaffold with guided TODOs & core LCEL logic
-├── requirements.txt     # Minimal, necessary dependencies
-├── .env.example         # Environment configuration template
-├── .gitignore           # Git ignore rules for Python & env files
+├── app.py               # Gradio v2 web interface with resume upload & matching tabs
+├── starter.py           # Practice scaffold with guided TODOs 1-7 & data schemas
+├── requirements.txt     # Session 02 dependencies (Chroma, HuggingFace, PyPDF, etc.)
+├── .env.example         # Environment template with Groq & Hugging Face configs
+├── .gitignore           # Git ignore rules for Python, Chroma DB, and cache files
 ├── LICENSE              # MIT License
-└── README.md            # Documentation & step-by-step guide
+└── README.md            # Comprehensive project documentation & architecture guide
 ```
+
+---
+
+## 🗺️ Project Roadmap
+
+| Stage | Module | Focus | Status |
+|---|---|---|:---:|
+| **Part 01** | `01_chat_foundation` | Streaming Chat, LCEL Pipelines, Structured Profile Extraction | ✅ Complete |
+| **Part 02** | `02_ingestion` | Resume Parsing, Job Description Ingestion, Embeddings & Chroma Matching | 🚀 **Current** |
+| **Part 03** | `03_rag` | Grounded Career RAG Assistant with Re-ranking & Citations | 🔜 Upcoming |
+| **Part 04** | `04_langgraph` | Stateful Multi-Step Workflows & Human-in-the-Loop Review | 🔜 Upcoming |
+| **Part 05** | `05_multiagents` | Specialized Multi-Agent Coaching Crew | 🔜 Upcoming |
+| **Part 06** | `06_production_llms` | Production Gateway, Guardrails, Fallbacks & Observability | 🔜 Upcoming |
 
 ---
 
 ## 🛠️ Technology Stack
 
-- **Framework**: [LangChain](https://python.langchain.com/) (`langchain`, `langchain-core`, `langchain-groq`, `langchain-ollama`)
+- **Framework**: [LangChain](https://python.langchain.com/) (`langchain-core`, `langchain-community`, `langchain-text-splitters`)
 - **LLM Inference**: [Groq](https://groq.com/) / [Ollama](https://ollama.com/)
-- **Data Validation**: [Pydantic v2](https://docs.pydantic.dev/)
-- **Web UI**: [Gradio](https://gradio.app/)
-- **Environment**: [python-dotenv](https://github.com/theskumar/python-dotenv)
+- **Embeddings**: [Hugging Face Endpoint](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (`sentence-transformers/all-MiniLM-L6-v2`)
+- **Vector Database**: [ChromaDB](https://docs.trychroma.com/) (`langchain-chroma`)
+- **Document Loaders**: [PyPDF](https://pypdf.readthedocs.io/) & TextLoader
+- **Validation**: [Pydantic v2](https://docs.pydantic.dev/)
+- **UI**: [Gradio](https://gradio.app/)
 
 ---
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is open-source under the [MIT License](LICENSE).

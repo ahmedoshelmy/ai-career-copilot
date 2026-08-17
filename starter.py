@@ -1,7 +1,6 @@
 """
-Career Copilot — Session 02: Resume & Job Ingestion (STARTER)
-Module: 02_ingestion
-
+AI Career Copilot — Session 02: Resume & Job Ingestion (STARTER)
+================================================================
 Concepts practised:
 - TextLoader, PyPDFLoader, DirectoryLoader
 - RecursiveCharacterTextSplitter
@@ -11,8 +10,6 @@ Concepts practised:
 
 Fill in every TODO. The __main__ block will tell you what is missing even
 when some steps are incomplete.
-
-See career_copilot/README.md for the full spec.
 """
 
 import os
@@ -32,6 +29,7 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 
 def safe_print(*args, **kwargs):
+    """Print helper handling potential Unicode console issues."""
     try:
         print(*args, **kwargs)
     except UnicodeEncodeError:
@@ -39,14 +37,15 @@ def safe_print(*args, **kwargs):
         print(text.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding))
 
 
-# ── LLM / embeddings factories ────────────────────────────────────────────────
+# ── LLM / Embeddings Factories ───────────────────────────────────────────────
 
 def get_llm(provider: str = "groq", temperature: float = 0.7):
+    """Create a chat model for 'groq' (default) or 'ollama'."""
     if provider == "groq":
         from langchain_groq import ChatGroq
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GROQ_API_KEY not found.")
+            raise ValueError("GROQ_API_KEY not found. Copy .env.example to .env first.")
         return ChatGroq(
             model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             api_key=api_key,
@@ -67,10 +66,11 @@ def get_llm(provider: str = "groq", temperature: float = 0.7):
 
 
 def get_embeddings():
+    """Create HuggingFace serverless embeddings client."""
     from langchain_huggingface import HuggingFaceEndpointEmbeddings
     api_key = os.getenv("HUGGING_FACE_API_KEY")
     if not api_key:
-        raise ValueError("HUGGING_FACE_API_KEY not found.")
+        raise ValueError("HUGGING_FACE_API_KEY not found. Set it in .env to use embeddings.")
     return HuggingFaceEndpointEmbeddings(
         huggingfacehub_api_token=api_key,
         model="sentence-transformers/all-MiniLM-L6-v2",
@@ -99,7 +99,7 @@ class CopilotV2Result(BaseModel):
     skill_gap: SkillGapAnalysis
 
 
-# ── Sample data (used when no files are provided) ─────────────────────────────
+# ── Sample Data ───────────────────────────────────────────────────────────────
 
 SAMPLE_RESUME = """
 Alex Kim — Software Engineer
@@ -287,4 +287,4 @@ if __name__ == "__main__":
         print_result(result)
     except NotImplementedError as e:
         safe_print(f"Not implemented yet -> {e}")
-        safe_print("\nComplete the TODOs above and re-run.")
+        safe_print("\nComplete the TODOs above in starter.py and re-run.")
