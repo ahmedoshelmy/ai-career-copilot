@@ -1,34 +1,37 @@
 """
-Career Copilot — Session 01: Chat Foundation (STARTER)
-Module: 01_langchain
+Career Copilot — Session 02: Resume & Job Ingestion (STARTER)
+Module: 02_ingestion
 
 Concepts practised:
-- ChatPromptTemplate + MessagesPlaceholder
-- LCEL pipe operator (|)
-- StrOutputParser (streaming)
-- with_structured_output (Pydantic structured extraction)
-- Message types: SystemMessage, HumanMessage, AIMessage
+- TextLoader, PyPDFLoader, DirectoryLoader
+- RecursiveCharacterTextSplitter
+- HuggingFaceEndpointEmbeddings
+- Chroma vector store (from_documents, similarity_search_with_score)
+- with_structured_output (SkillGapAnalysis)
 
-Fill in every TODO below. The __main__ block will tell you what's next
-even when some steps are still unfinished.
+Fill in every TODO. The __main__ block will tell you what is missing even
+when some steps are incomplete.
+
+See career_copilot/README.md for the full spec.
 """
 
 import os
 import sys
-from typing import Generator, List, Optional
+import tempfile
+from pathlib import Path
+from typing import List, Optional
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from langchain_groq import ChatGroq
-from langchain_ollama import ChatOllama
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
 
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 
 def safe_print(*args, **kwargs):
-    """Print that survives Unicode issues on Windows consoles."""
     try:
         print(*args, **kwargs)
     except UnicodeEncodeError:
@@ -36,12 +39,14 @@ def safe_print(*args, **kwargs):
         print(text.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding))
 
 
+# ── LLM / embeddings factories ────────────────────────────────────────────────
+
 def get_llm(provider: str = "groq", temperature: float = 0.7):
-    """Create a chat model for 'groq' (default) or 'ollama'."""
     if provider == "groq":
+        from langchain_groq import ChatGroq
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GROQ_API_KEY not found. Copy .env.example to .env first.")
+            raise ValueError("GROQ_API_KEY not found.")
         return ChatGroq(
             model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             api_key=api_key,
@@ -49,6 +54,7 @@ def get_llm(provider: str = "groq", temperature: float = 0.7):
             max_retries=5,
         )
     if provider == "ollama":
+        from langchain_ollama import ChatOllama
         api_key = os.getenv("OLLAMA_API_KEY")
         if not api_key:
             raise ValueError("OLLAMA_API_KEY not found.")
@@ -56,136 +62,229 @@ def get_llm(provider: str = "groq", temperature: float = 0.7):
             model="gpt-oss:120b-cloud",
             base_url="https://ollama.com",
             client_kwargs={"headers": {"Authorization": f"Bearer {api_key}"}},
-            temperature=temperature,
         )
     raise ValueError(f"Unknown provider: {provider}")
 
 
-# ============================================================
-# Schemas
-# ============================================================
-
-class CandidateProfile(BaseModel):
-    """Structured profile extracted from the conversation."""
-    target_role: str = Field(description="The job title the candidate is targeting, e.g. 'Senior Backend Engineer'")
-    years_of_experience: int = Field(description="Estimated total years of relevant work experience (0 if student)")
-    top_skills: List[str] = Field(description="Up to 5 key technical or domain skills mentioned")
-    current_situation: str = Field(
-        description="One-sentence summary: student / employed looking / actively job-hunting / career-changer"
+def get_embeddings():
+    from langchain_huggingface import HuggingFaceEndpointEmbeddings
+    api_key = os.getenv("HUGGING_FACE_API_KEY")
+    if not api_key:
+        raise ValueError("HUGGING_FACE_API_KEY not found.")
+    return HuggingFaceEndpointEmbeddings(
+        huggingfacehub_api_token=api_key,
+        model="sentence-transformers/all-MiniLM-L6-v2",
     )
 
 
-class CareerAdvice(BaseModel):
-    """Structured career advice for a specific question."""
-    advice: str = Field(description="Concise, actionable advice in 2-3 sentences")
-    action_items: List[str] = Field(description="2-4 specific, immediate next steps the candidate can take")
-    resources: List[str] = Field(description="1-3 recommended resources (courses, tools, communities)")
+# ── Schemas ───────────────────────────────────────────────────────────────────
+
+class JobMatch(BaseModel):
+    title: str = Field(description="Job title from metadata")
+    company: str = Field(description="Company name from metadata")
+    similarity: float = Field(description="Similarity score 0-100")
 
 
-SYSTEM_PROMPT = (
-    "You are Career Copilot, a friendly and professional AI career coach. "
-    "Your goal is to help candidates land their dream job. "
-    "Ask about their target role and experience if not provided. "
-    "Give specific, actionable advice tailored to their situation. "
-    "Keep responses concise — 2-4 sentences unless the user asks for detail."
-)
+class SkillGapAnalysis(BaseModel):
+    matched_skills: List[str] = Field(description="Skills the resume already shows that the job wants")
+    missing_skills: List[str] = Field(description="Skills the job requires that are NOT in the resume")
+    fit_summary: str = Field(description="One-paragraph overall fit assessment")
+    improvement_tips: List[str] = Field(description="2-3 specific tips to close the skill gap")
 
-SAMPLE_CONVERSATION = [
-    HumanMessage(content="Hi! I'm a junior Python developer with 1 year of experience. I want to become a backend engineer at a fintech company."),
-    AIMessage(content="Great to meet you! Fintech backend roles typically require strong Python, REST API design, and some experience with databases like PostgreSQL. With 1 year under your belt, focusing on system design basics and contributing to open source will make your CV stand out. What specific areas do you feel least confident in?"),
-    HumanMessage(content="Honestly, system design. I've never done a system design interview before."),
-]
+
+class CopilotV2Result(BaseModel):
+    resume_chunks: int
+    job_count: int
+    top_matches: List[JobMatch]
+    skill_gap: SkillGapAnalysis
+
+
+# ── Sample data (used when no files are provided) ─────────────────────────────
+
+SAMPLE_RESUME = """
+Alex Kim — Software Engineer
+
+Skills: Python, FastAPI, PostgreSQL, Docker, Git, basic React, REST API design.
+
+Experience:
+- Built and deployed a FastAPI microservice for a small e-commerce startup (6 months).
+- Wrote SQL migrations and optimised slow queries for a PostgreSQL database.
+- Containerised services with Docker and Docker Compose.
+
+Education: BSc Computer Science, graduated 2023.
+Currently looking for a mid-level backend role in a product company.
+"""
+
+SAMPLE_JOBS_DIR_CONTENT = {
+    "backend_engineer_stripe.txt": (
+        "Job: Backend Software Engineer @ Stripe\n"
+        "Requirements: Python (expert), distributed systems, PostgreSQL or MySQL, "
+        "REST API design, Docker/Kubernetes. Nice-to-have: Go, Kafka, AWS."
+    ),
+    "fullstack_shopify.txt": (
+        "Job: Full-Stack Engineer @ Shopify\n"
+        "Requirements: React, Node.js, Ruby on Rails, PostgreSQL, GraphQL, "
+        "strong TypeScript. Backend Python is a plus."
+    ),
+    "devops_cloudflare.txt": (
+        "Job: DevOps Engineer @ Cloudflare\n"
+        "Requirements: Kubernetes, Terraform, CI/CD pipelines, Prometheus, "
+        "Go or Python scripting, cloud (AWS/GCP)."
+    ),
+    "ml_engineer_huggingface.txt": (
+        "Job: ML Engineer @ HuggingFace\n"
+        "Requirements: Python, PyTorch, Transformers library, CUDA, MLOps, "
+        "Docker. Experience with LLM fine-tuning or deployment is a strong plus."
+    ),
+    "backend_django_startup.txt": (
+        "Job: Backend Python Engineer @ EarlyStage.io\n"
+        "Requirements: Python, Django or FastAPI, PostgreSQL, REST APIs, "
+        "Docker, basic AWS (EC2/S3). Team player in a fast-paced startup."
+    ),
+}
 
 
 # ============================================================
-# TODO 1: build_chat_chain
+# TODO 1: load_resume
 # ============================================================
 
-def build_chat_chain(llm):
-    """Build the streaming LCEL chat chain.
+def load_resume(source: str) -> Document:
+    """Load the resume as a single LangChain Document.
 
     TODO 1:
-      - Create a ChatPromptTemplate with:
-          * a system message using SYSTEM_PROMPT
-          * a MessagesPlaceholder named "history"
-          * a human turn using "{question}"
-      - Return:  prompt | llm | StrOutputParser()
+      - If `source` is a file path that exists:
+          * If it ends with '.pdf': use PyPDFLoader(source).load() and join pages
+          * Otherwise: use TextLoader(source).load()[0]
+      - If `source` is raw text (not a path): wrap it in Document(page_content=source, metadata={"source": "pasted_resume"})
+      - Return a single Document with metadata["source"] set.
     """
-    raise NotImplementedError("TODO 1: implement build_chat_chain")
+    raise NotImplementedError("TODO 1: implement load_resume")
 
 
 # ============================================================
-# TODO 2: stream_reply
+# TODO 2: load_job_postings
 # ============================================================
 
-def stream_reply(chain, history: List[BaseMessage], question: str) -> Generator[str, None, None]:
-    """Stream the copilot's reply token by token.
+def load_job_postings(directory: str) -> List[Document]:
+    """Load all .txt job description files from a directory.
 
     TODO 2:
-      - Call chain.stream({"history": history, "question": question})
-      - yield each chunk (already a string because of StrOutputParser)
+      - Use DirectoryLoader(directory, glob="**/*.txt") to load all files.
+      - Set metadata["title"] and ["company"] from the filename
+        (e.g. "backend_engineer_stripe.txt" -> title="Backend Engineer", company="Stripe").
+      - Return the list of Documents.
     """
-    raise NotImplementedError("TODO 2: implement stream_reply")
+    raise NotImplementedError("TODO 2: implement load_job_postings")
 
 
 # ============================================================
-# TODO 3: extract_profile
+# TODO 3: chunk_documents
 # ============================================================
 
-def extract_profile(llm, conversation: List[BaseMessage]) -> CandidateProfile:
-    """Extract a structured CandidateProfile from the conversation so far.
+def chunk_documents(docs: List[Document], chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
+    """Split documents into chunks.
 
     TODO 3:
-      - structured_llm = llm.with_structured_output(CandidateProfile)
-      - Build a prompt: system + the conversation messages + a final human
-        message asking to extract the profile
-      - Return the CandidateProfile
+      - Create RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+      - Return splitter.split_documents(docs)
     """
-    raise NotImplementedError("TODO 3: implement extract_profile")
+    raise NotImplementedError("TODO 3: implement chunk_documents")
 
 
 # ============================================================
-# TODO 4: answer_career_question
+# TODO 4: build_job_vectorstore
 # ============================================================
 
-def answer_career_question(llm, role: str, question: str) -> CareerAdvice:
-    """Answer a specific career question with structured advice.
+def build_job_vectorstore(job_docs: List[Document], persist_directory: str):
+    """Embed and index job documents in Chroma.
 
     TODO 4:
-      - structured_llm = llm.with_structured_output(CareerAdvice)
-      - Build a ChatPromptTemplate with system + human containing
-        the role context and question
-      - chain = prompt | structured_llm
-      - Return CareerAdvice
+      - embeddings = get_embeddings()
+      - Use Chroma.from_documents(documents=job_docs, embedding=embeddings,
+          persist_directory=persist_directory, collection_name="career_copilot_jobs")
+      - Return the Chroma instance.
     """
-    raise NotImplementedError("TODO 4: implement answer_career_question")
+    raise NotImplementedError("TODO 4: implement build_job_vectorstore")
 
 
 # ============================================================
-# TODO 5: run_demo
+# TODO 5: find_best_matches
 # ============================================================
 
-def run_demo():
-    """Demonstrate the full session-01 Career Copilot.
+def find_best_matches(vectorstore, resume_text: str, k: int = 3) -> List[JobMatch]:
+    """Rank job postings by semantic similarity to the resume.
 
     TODO 5:
-      - llm = get_llm("groq")
-      - chain = build_chat_chain(llm)
-      - Replay SAMPLE_CONVERSATION to show streaming:
-          * For each HumanMessage: call stream_reply(chain, history_so_far, msg.content)
-            collect and print the streamed chunks
-          * Append human + AI messages to a running history list
-      - After the conversation, call extract_profile(llm, history) and print it
-      - Call answer_career_question(llm, "Backend Engineer", "How do I prepare for system design interviews?")
-        and print the CareerAdvice
+      - results = vectorstore.similarity_search_with_score(resume_text, k=k)
+      - For each (doc, distance): similarity = round(1 / (1 + distance) * 100, 1)
+      - Build JobMatch objects using doc.metadata for title/company
+      - Sort by similarity descending and return the list.
     """
-    raise NotImplementedError("TODO 5: implement run_demo")
+    raise NotImplementedError("TODO 5: implement find_best_matches")
+
+
+# ============================================================
+# TODO 6: analyze_skill_gap
+# ============================================================
+
+def analyze_skill_gap(llm, resume_text: str, job_title: str, job_description: str) -> SkillGapAnalysis:
+    """Compare resume against one job description and return structured gap analysis.
+
+    TODO 6:
+      - structured_llm = llm.with_structured_output(SkillGapAnalysis)
+      - Build a ChatPromptTemplate with a system message (career coach persona)
+        and a human message with resume + job details
+      - Return SkillGapAnalysis
+    """
+    raise NotImplementedError("TODO 6: implement analyze_skill_gap")
+
+
+# ============================================================
+# TODO 7: run_copilot_v2
+# ============================================================
+
+def run_copilot_v2(resume_source: str, jobs_dir: str) -> CopilotV2Result:
+    """Orchestrate the full session-02 ingestion pipeline.
+
+    TODO 7:
+      - Load resume: resume_doc = load_resume(resume_source)
+      - Load & chunk jobs: job_docs = chunk_documents(load_job_postings(jobs_dir))
+      - Build vectorstore
+      - Find top matches
+      - Analyze gap for the top match
+      - Return CopilotV2Result
+    """
+    raise NotImplementedError("TODO 7: implement run_copilot_v2")
+
+
+def print_result(result: CopilotV2Result) -> None:
+    safe_print("=" * 60)
+    safe_print(f"Resume indexed : {result.resume_chunks} chunk(s)")
+    safe_print(f"Jobs indexed   : {result.job_count}")
+    safe_print("\nTOP JOB MATCHES")
+    for i, m in enumerate(result.top_matches, 1):
+        safe_print(f"  {i}. {m.title} @ {m.company}  ({m.similarity}% match)")
+    safe_print("\nSKILL GAP vs. Top Match")
+    safe_print(f"  Matched  : {', '.join(result.skill_gap.matched_skills)}")
+    safe_print(f"  Missing  : {', '.join(result.skill_gap.missing_skills)}")
+    safe_print(f"  Summary  : {result.skill_gap.fit_summary}")
+    safe_print("  Tips:")
+    for tip in result.skill_gap.improvement_tips:
+        safe_print(f"    - {tip}")
+    safe_print("=" * 60)
 
 
 if __name__ == "__main__":
-    safe_print("Career Copilot — Session 01: Chat Foundation\n")
+    safe_print("Career Copilot — Session 02: Resume & Job Ingestion\n")
+
+    # Write sample job files to a temp dir for the demo
+    jobs_dir = tempfile.mkdtemp(prefix="cc_jobs_")
+    for fname, content in SAMPLE_JOBS_DIR_CONTENT.items():
+        Path(jobs_dir, fname).write_text(content, encoding="utf-8")
+
     try:
-        run_demo()
+        result = run_copilot_v2(SAMPLE_RESUME, jobs_dir)
+        print_result(result)
     except NotImplementedError as e:
         safe_print(f"Not implemented yet -> {e}")
         safe_print("\nComplete the TODOs above and re-run.")
