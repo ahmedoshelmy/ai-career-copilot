@@ -1,25 +1,19 @@
-# AI Career Copilot — Session 02: Ingestion & Matching Dependencies
+# AI Career Copilot — Session 04: LangGraph Stateful Workflows
 
-# LangChain & Ecosystem
+# LangGraph & Core Framework
+langgraph>=0.2.0
 langchain>=0.3.0
 langchain-core>=0.3.0
 langchain-community>=0.3.0
-langchain-text-splitters>=0.3.0
 
-# LLM & Embeddings Providers
+# LLM Providers
 langchain-groq>=0.2.0
-langchain-ollama>=0.2.0
-langchain-huggingface>=0.1.0
-sentence-transformers>=3.0.0
+groq>=0.11.0
 
-# Vector Store & Document Parsing
-langchain-chroma>=0.1.4
-chromadb>=0.5.0
-pypdf>=4.0.0
-
-# Data Validation & Environment
+# Validation & Environment
 pydantic>=2.0.0
+typing-extensions>=4.8.0
 python-dotenv>=1.0.0
 
-# Interactive Web Application
+# Web Dashboard UI
 gradio>=4.0.0

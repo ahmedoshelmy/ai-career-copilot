@@ -1,15 +1,18 @@
 """
-AI Career Copilot — Session 02: Ingestion, Embeddings & Matching (Web App)
+AI Career Copilot — Session 04: LangGraph Stateful Workflow (Web Dashboard)
 ==========================================================================
-Imports logic from starter.py — as you implement each TODO in starter.py,
-the file upload, semantic matching, and skill-gap analysis update dynamically.
+Interactive Gradio Dashboard featuring:
+- Dynamic action routing (Tailor Resume / Cover Letter / Mock Interview)
+- Automated self-correction review cycles
+- Human-in-the-Loop approval gate (interrupt_before)
+- Live LangGraph Checkpoint State Inspector (MemorySaver)
 """
 
 import os
 import sys
-import tempfile
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -17,34 +20,22 @@ load_dotenv()
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 import gradio as gr
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_groq import ChatGroq
 
 # ── Import logic from starter.py ─────────────────────────────────────────────
 try:
     from starter import (
-        get_llm,
-        get_embeddings,
-        load_resume,
-        load_job_postings,
-        chunk_documents,
-        build_job_vectorstore,
-        find_best_matches,
-        analyze_skill_gap,
-        run_copilot_v2,
+        build_graph,
         SAMPLE_RESUME,
-        SAMPLE_JOBS_DIR_CONTENT,
-        JobMatch,
-        SkillGapAnalysis,
-        CopilotV2Result,
+        SAMPLE_JOB,
+        CopilotState,
     )
     _IMPORT_OK = True
     _IMPORT_ERR = ""
 except Exception as e:
     _IMPORT_OK = False
     _IMPORT_ERR = f"Error importing starter.py: {e}"
+    SAMPLE_RESUME = ""
+    SAMPLE_JOB = ""
 
 GROQ_MODELS = [
     "openai/gpt-oss-20b",
@@ -53,176 +44,184 @@ GROQ_MODELS = [
     "llama-3.1-8b-instant",
 ]
 
-SYSTEM_PROMPT = (
-    "You are Career Copilot, a friendly and professional AI career coach. "
-    "Help the candidate land their dream job. Keep replies concise and actionable."
-)
+# ── Graph Cache ───────────────────────────────────────────────────────────────
+_graph_cache: dict = {}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def lc_history_from_gradio(gr_history: list) -> List[BaseMessage]:
-    """Convert Gradio chat history format to LangChain BaseMessage list."""
-    msgs: List[BaseMessage] = []
-    for msg in gr_history:
-        role = msg["role"] if isinstance(msg, dict) else msg.role
-        content = msg["content"] if isinstance(msg, dict) else msg.content
-        if role == "user":
-            msgs.append(HumanMessage(content=content))
-        elif role == "assistant":
-            msgs.append(AIMessage(content=content))
-    return msgs
-
-
-def _get_llm(model: str, temperature: float = 0.5):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set in .env")
-    return ChatGroq(model=model, api_key=api_key, temperature=temperature, max_retries=3)
+def get_graph():
+    """Build (or return cached) compiled LangGraph state machine from starter.py."""
+    if not _IMPORT_OK:
+        raise RuntimeError(_IMPORT_ERR)
+    key = "graph"
+    if key not in _graph_cache:
+        _graph_cache[key] = build_graph()
+    return _graph_cache[key]
 
 
 # ── Gradio Handlers ───────────────────────────────────────────────────────────
 
-def chat(user_message: str, history: list, model: str, temperature: float):
-    """Handle general career coaching chat turns."""
-    if not user_message.strip():
-        yield history
-        return
-
-    try:
-        llm = _get_llm(model, temperature)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{question}"),
-        ])
-        chain = prompt | llm | StrOutputParser()
-    except Exception as e:
-        yield history + [
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": f"⚠️ **Error initializing model:** {e}"},
-        ]
-        return
-
-    lc_history = lc_history_from_gradio(history)
-    history = history + [{"role": "user", "content": user_message}]
-    history.append({"role": "assistant", "content": ""})
-
-    try:
-        for chunk in chain.stream({"history": lc_history, "question": user_message}):
-            history[-1]["content"] += chunk
-            yield history
-    except Exception as e:
-        history[-1]["content"] = f"⚠️ **Streaming Error:** {e}"
-        yield history
-
-
-def run_match_pipeline(
-    resume_text: str,
-    resume_file,
-    job_files,
-    model: str,
-    temperature: float,
-    top_k: int,
-):
-    """Run full ingestion, semantic vector search, and skill-gap analysis."""
+def run_workflow(resume: str, job: str, action: str, max_iter: int, thread_id: str):
+    """Execute the LangGraph workflow up to completion or human interrupt."""
     if not _IMPORT_OK:
-        return f"⚠️ **Import error:** `{_IMPORT_ERR}`"
+        return f"⚠️ **Import error:** `{_IMPORT_ERR}`", "{}", gr.update(visible=False), "Import error."
 
     try:
-        # Prepare job postings directory
-        if job_files:
-            jobs_dir = tempfile.mkdtemp(prefix="cc2_custom_")
-            for f in job_files:
-                src = Path(f.name)
-                (Path(jobs_dir) / src.name).write_bytes(src.read_bytes())
+        app = get_graph()
+        config = {"configurable": {"thread_id": thread_id}}
+        initial = {
+            "resume": resume or SAMPLE_RESUME,
+            "job_posting": job or SAMPLE_JOB,
+            "desired_action": action,
+            "target_role": "",
+            "company": "",
+            "tailored_bullets": "",
+            "cover_letter_draft": "",
+            "editor_feedback": "",
+            "quality_score": 0.0,
+            "approved": False,
+            "interview_questions": "",
+            "iteration": 0,
+            "max_iterations": int(max_iter),
+            "thread_id": thread_id,
+        }
+
+        log_lines = [f"🚀 Starting workflow on thread '{thread_id}' with action: '{action}'..."]
+        for event in app.stream(initial, config, stream_mode="values"):
+            it = event.get("iteration", 0)
+            qs = event.get("quality_score", 0.0)
+            if event.get("cover_letter_draft") and it > 0:
+                log_lines.append(f"✍️ Draft revision {it} generated — Editor Quality Score: {qs:.2f}/1.0")
+            if event.get("tailored_bullets"):
+                log_lines.append("📄 Resume bullet tailoring completed.")
+            if event.get("interview_questions"):
+                log_lines.append("🎯 Interview questions generated.")
+
+        state_snap = app.get_state(config)
+        paused = bool(state_snap.next)
+        vals = state_snap.values
+        result_md = _render_result(action, vals)
+        state_json = json.dumps({k: v for k, v in vals.items() if v}, indent=2, default=str)
+        approval_visible = paused and "hitl_approval" in (state_snap.next or [])
+
+        if approval_visible:
+            log_lines.append("⏸️ Workflow PAUSED at 'hitl_approval' node — Human approval required to proceed.")
         else:
-            jobs_dir = tempfile.mkdtemp(prefix="cc2_sample_")
-            for fname, content in SAMPLE_JOBS_DIR_CONTENT.items():
-                Path(jobs_dir, fname).write_text(content, encoding="utf-8")
+            log_lines.append("✅ Workflow reached END state successfully.")
 
-        # Select resume source
-        resume_source = resume_text.strip() if resume_text.strip() else SAMPLE_RESUME
-        if resume_file:
-            resume_source = str(resume_file.name)
-
-        result: CopilotV2Result = run_copilot_v2(resume_source, jobs_dir)
-
-        md = f"**📄 Resume Chunks Indexed:** `{result.resume_chunks}` | **🏢 Job Postings:** `{result.job_count}`\n\n"
-        md += "### 🏆 Top Job Matches\n\n"
-        for i, m in enumerate(result.top_matches, 1):
-            bar = "█" * int(m.similarity / 10) + "░" * (10 - int(m.similarity / 10))
-            md += f"**{i}. {m.title} @ {m.company}** — `{m.similarity}%` `[{bar}]`\n\n"
-
-        md += f"---\n### 🔍 Skill Gap Analysis vs. **{result.top_matches[0].title}**\n\n"
-        md += f"**✅ Matched Skills:** {', '.join(result.skill_gap.matched_skills) if result.skill_gap.matched_skills else 'None'}\n\n"
-        md += f"**❌ Missing Skills:** {', '.join(result.skill_gap.missing_skills) if result.skill_gap.missing_skills else 'None'}\n\n"
-        md += f"**📋 Assessment:** {result.skill_gap.fit_summary}\n\n"
-        md += "### 💡 Recommended Action Items:\n" + "\n".join(f"- {t}" for t in result.skill_gap.improvement_tips)
-        return md
+        log = "\n".join(log_lines)
+        return result_md, state_json, gr.update(visible=approval_visible), log
 
     except NotImplementedError as e:
-        return f"⚠️ **TODO Not Implemented Yet:** `{e}`\n\nOpen `starter.py` and implement this function to enable resume matching."
+        return (
+            f"⚠️ **TODO Not Implemented Yet:** `{e}`\n\nOpen `starter.py` and implement this function to enable the workflow.",
+            "{}",
+            gr.update(visible=False),
+            str(e),
+        )
     except Exception as e:
-        return f"⚠️ **Error running pipeline:** {e}\n\nEnsure `GROQ_API_KEY` and `HUGGING_FACE_API_KEY` are configured in `.env`."
+        return f"⚠️ **Execution Error:** {e}", "{}", gr.update(visible=False), str(e)
 
 
-# ── Gradio UI ─────────────────────────────────────────────────────────────────
+def approve_workflow(thread_id: str):
+    """Resume an interrupted LangGraph session after human approval."""
+    if not _IMPORT_OK:
+        return f"⚠️ **Import error:** `{_IMPORT_ERR}`", "{}", gr.update(visible=False), "Import error."
 
-with gr.Blocks(title="AI Career Copilot v2 — Ingestion & Matching") as demo:
+    try:
+        app = get_graph()
+        config = {"configurable": {"thread_id": thread_id}}
+        app.invoke(None, config)  # Resume without state updates
+        vals = app.get_state(config).values
+        return (
+            _render_result("cover_letter", vals),
+            json.dumps({k: v for k, v in vals.items() if v}, indent=2, default=str),
+            gr.update(visible=False),
+            "✅ Human approved — workflow resumed from checkpoint and completed.",
+        )
+    except Exception as e:
+        return f"⚠️ **Error during approval:** {e}", "{}", gr.update(visible=False), str(e)
+
+
+def _render_result(action: str, vals: dict) -> str:
+    """Render markdown representation of current state results."""
+    if vals.get("cover_letter_draft"):
+        cl = vals["cover_letter_draft"]
+        qs = vals.get("quality_score", 0.0)
+        it = vals.get("iteration", 0)
+        fb = vals.get("editor_feedback", "")
+        status_tag = "✅ Approved by Human/Editor" if vals.get("approved") else "⏳ Pending Review"
+        md = f"### ✉️ Cover Letter (Iteration {it} | Quality: `{qs:.2f}/1.0` | {status_tag})\n\n{cl}"
+        if fb:
+            md += f"\n\n---\n**📝 Editor Feedback:** {fb}"
+        return md
+    if vals.get("tailored_bullets"):
+        return f"### 📄 Tailored Resume Bullets\n\n{vals['tailored_bullets']}"
+    if vals.get("interview_questions"):
+        return f"### 🎯 Role-Specific Interview Questions\n\n{vals['interview_questions']}"
+    return "_Click 'Run Workflow' to execute the LangGraph state machine._"
+
+
+# ── Gradio Dashboard UI ───────────────────────────────────────────────────────
+
+with gr.Blocks(title="AI Career Copilot v4 — LangGraph Stateful Workflow") as demo:
     gr.Markdown(
-        "# 🧭 AI Career Copilot — Session 02\n"
-        "### Ingestion, Embeddings, Chroma Vector Search & Skill-Gap Analysis\n"
-        "Upload your resume and target job postings to discover top job matches and personalized skill-gap insights."
+        "# 🧭 AI Career Copilot — Session 04\n"
+        "### Stateful Multi-Step LangGraph Workflow with Self-Correction & Human-in-the-Loop\n"
+        "Route career requests dynamically, run automated editor feedback loops, and approve drafts with state persistence."
     )
 
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### ⚙️ Settings")
-            model_dd = gr.Dropdown(GROQ_MODELS, value=GROQ_MODELS[0], label="LLM Model")
-            temp_sl = gr.Slider(0.0, 1.5, value=0.5, step=0.1, label="Temperature")
-            top_k = gr.Slider(1, 10, value=3, step=1, label="Top-K Matches")
+            gr.Markdown("### ⚙️ Workflow Settings")
+            action_radio = gr.Radio(
+                ["cover_letter", "tailor_resume", "mock_interview"],
+                value="cover_letter",
+                label="Select Action / Specialist Node",
+            )
+            max_iter_sl = gr.Slider(1, 5, value=3, step=1, label="Max Self-Correction Iterations")
+            thread_id_box = gr.Textbox(value="candidate-session-01", label="Thread / Session ID (MemorySaver)")
             if not os.getenv("GROQ_API_KEY"):
                 gr.Markdown("> ⚠️ **Warning:** `GROQ_API_KEY` not found in `.env`.")
-            if not os.getenv("HUGGING_FACE_API_KEY"):
-                gr.Markdown("> ⚠️ **Warning:** `HUGGING_FACE_API_KEY` not found in `.env` (required for embeddings).")
             gr.Markdown("---")
-            gr.Markdown("_Core logic is imported from `starter.py`._")
+            gr.Markdown("_State machine compiled via `build_graph()` in `starter.py`._")
 
         with gr.Column(scale=3):
             with gr.Tabs():
-                with gr.Tab("🎯 Resume Match & Skill Gap"):
-                    gr.Markdown("#### 📄 1. Your Resume")
-                    resume_file = gr.File(label="Upload Resume (.txt or .pdf)", file_types=[".txt", ".pdf"])
-                    resume_text = gr.Textbox(
-                        label="Or Paste Resume Text (used if no file uploaded)",
+                with gr.Tab("🚀 Workflow Execution"):
+                    resume_box = gr.Textbox(
+                        label="Candidate Resume (leave blank to use built-in sample)",
                         value=SAMPLE_RESUME if _IMPORT_OK else "",
-                        lines=6,
+                        lines=5,
                     )
-                    gr.Markdown("#### 🏢 2. Target Job Postings")
-                    job_files = gr.File(
-                        label="Upload .txt Job Files (leave empty to use built-in sample tech jobs)",
-                        file_types=[".txt"],
-                        file_count="multiple",
+                    job_box = gr.Textbox(
+                        label="Target Job Posting (leave blank to use built-in sample)",
+                        value=SAMPLE_JOB if _IMPORT_OK else "",
+                        lines=4,
                     )
-                    run_btn = gr.Button("🚀 Find My Best Matches & Analyze Skill Gap", variant="primary")
-                    results_md = gr.Markdown("_Click the button above to run the ingestion & matching pipeline._")
+                    run_btn = gr.Button("▶️ Run LangGraph Workflow", variant="primary")
+                    workflow_log = gr.Textbox(label="Execution Log", lines=3, interactive=False)
 
-                with gr.Tab("💬 Career Coach Chat"):
-                    chatbot = gr.Chatbot(label="Career Copilot", height=400)
-                    with gr.Row():
-                        msg_box = gr.Textbox(placeholder="Ask any career, CV, or interview question...", label="Message", scale=5)
-                        send_btn = gr.Button("Send", variant="primary", scale=1)
-                    clear_btn = gr.Button("Clear Chat")
+                    approval_row = gr.Row(visible=False)
+                    with approval_row:
+                        gr.Markdown("### 🛑 Human-in-the-Loop Approval Required")
+                        approve_btn = gr.Button("👍 Approve & Finalize Cover Letter", variant="primary")
 
-    send_btn.click(chat, [msg_box, chatbot, model_dd, temp_sl], chatbot).then(lambda: "", outputs=msg_box)
-    msg_box.submit(chat, [msg_box, chatbot, model_dd, temp_sl], chatbot).then(lambda: "", outputs=msg_box)
-    clear_btn.click(lambda: [], outputs=chatbot)
+                    result_md = gr.Markdown("_Click 'Run LangGraph Workflow' above to begin._")
+
+                with gr.Tab("🔍 Live State Inspector"):
+                    gr.Markdown("#### Real-time JSON snapshot from LangGraph `MemorySaver` checkpoint store:")
+                    state_json_box = gr.Code(language="json", label="Graph State Snapshot")
 
     run_btn.click(
-        run_match_pipeline,
-        inputs=[resume_text, resume_file, job_files, model_dd, temp_sl, top_k],
-        outputs=results_md,
+        run_workflow,
+        inputs=[resume_box, job_box, action_radio, max_iter_sl, thread_id_box],
+        outputs=[result_md, state_json_box, approval_row, workflow_log],
+    )
+
+    approve_btn.click(
+        approve_workflow,
+        inputs=[thread_id_box],
+        outputs=[result_md, state_json_box, approval_row, workflow_log],
     )
 
 

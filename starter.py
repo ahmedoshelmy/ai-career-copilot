@@ -1,31 +1,26 @@
 """
-AI Career Copilot — Session 02: Resume & Job Ingestion (STARTER)
-================================================================
+AI Career Copilot — Session 04: LangGraph Stateful Workflow (STARTER)
+======================================================================
 Concepts practised:
-- TextLoader, PyPDFLoader, DirectoryLoader
-- RecursiveCharacterTextSplitter
-- HuggingFaceEndpointEmbeddings
-- Chroma vector store (from_documents, similarity_search_with_score)
-- with_structured_output (SkillGapAnalysis)
+- StateGraph + TypedDict state with typed fields
+- add_conditional_edges (Intake & Editor Routing)
+- Self-correcting feedback loop (editor → writer cycle)
+- Human-in-the-loop (interrupt_before approval node)
+- MemorySaver checkpointing & thread session resume
 
-Fill in every TODO. The __main__ block will tell you what is missing even
-when some steps are incomplete.
+Fill in every TODO. The __main__ block will tell you what is missing.
 """
 
 import os
 import sys
-import tempfile
-from pathlib import Path
-from typing import List, Optional
+from typing import Literal, Optional
+from typing_extensions import TypedDict
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv()
-
-os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 
 def safe_print(*args, **kwargs):
@@ -37,254 +32,288 @@ def safe_print(*args, **kwargs):
         print(text.encode(sys.stdout.encoding, errors="replace").decode(sys.stdout.encoding))
 
 
-# ── LLM / Embeddings Factories ───────────────────────────────────────────────
-
 def get_llm(provider: str = "groq", temperature: float = 0.7):
-    """Create a chat model for 'groq' (default) or 'ollama'."""
+    """Create chat LLM instance."""
     if provider == "groq":
         from langchain_groq import ChatGroq
         api_key = os.getenv("GROQ_API_KEY")
         if not api_key:
-            raise ValueError("GROQ_API_KEY not found. Copy .env.example to .env first.")
+            raise ValueError("GROQ_API_KEY not found. Set it in .env first.")
         return ChatGroq(
             model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
             api_key=api_key,
             temperature=temperature,
             max_retries=5,
         )
-    if provider == "ollama":
-        from langchain_ollama import ChatOllama
-        api_key = os.getenv("OLLAMA_API_KEY")
-        if not api_key:
-            raise ValueError("OLLAMA_API_KEY not found.")
-        return ChatOllama(
-            model="gpt-oss:120b-cloud",
-            base_url="https://ollama.com",
-            client_kwargs={"headers": {"Authorization": f"Bearer {api_key}"}},
-        )
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def get_embeddings():
-    """Create HuggingFace serverless embeddings client."""
-    from langchain_huggingface import HuggingFaceEndpointEmbeddings
-    api_key = os.getenv("HUGGING_FACE_API_KEY")
-    if not api_key:
-        raise ValueError("HUGGING_FACE_API_KEY not found. Set it in .env to use embeddings.")
-    return HuggingFaceEndpointEmbeddings(
-        huggingfacehub_api_token=api_key,
-        model="sentence-transformers/all-MiniLM-L6-v2",
+# ── State Definition ──────────────────────────────────────────────────────────
+
+class CopilotState(TypedDict):
+    # Inputs
+    resume: str
+    job_posting: str
+    desired_action: str           # "tailor_resume" | "cover_letter" | "mock_interview"
+    target_role: str
+    company: str
+
+    # Outputs
+    tailored_bullets: str         # Rewritten resume bullets
+    cover_letter_draft: str       # Generated cover letter text
+    editor_feedback: str          # Editor critique / suggestions
+    quality_score: float          # 0.0–1.0 score
+    approved: bool                # Editor or human approved
+    interview_questions: str      # Numbered list of interview questions
+
+    # Control
+    iteration: int
+    max_iterations: int
+    thread_id: str
+
+
+# ── Pydantic Schemas for Structured Outputs ───────────────────────────────────
+
+class IntakeDecision(BaseModel):
+    action: Literal["tailor_resume", "cover_letter", "mock_interview"] = Field(
+        description="What the candidate wants the copilot to do"
     )
+    target_role: str = Field(description="The job title extracted from the posting")
+    company: str = Field(description="Company name extracted from the posting")
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class JobMatch(BaseModel):
-    title: str = Field(description="Job title from metadata")
-    company: str = Field(description="Company name from metadata")
-    similarity: float = Field(description="Similarity score 0-100")
-
-
-class SkillGapAnalysis(BaseModel):
-    matched_skills: List[str] = Field(description="Skills the resume already shows that the job wants")
-    missing_skills: List[str] = Field(description="Skills the job requires that are NOT in the resume")
-    fit_summary: str = Field(description="One-paragraph overall fit assessment")
-    improvement_tips: List[str] = Field(description="2-3 specific tips to close the skill gap")
-
-
-class CopilotV2Result(BaseModel):
-    resume_chunks: int
-    job_count: int
-    top_matches: List[JobMatch]
-    skill_gap: SkillGapAnalysis
+class EditorReview(BaseModel):
+    quality_score: float = Field(description="Quality score between 0.0 and 1.0")
+    feedback: str = Field(description="Specific, actionable feedback for the writer")
+    approved: bool = Field(description="True if quality_score >= 0.8")
 
 
 # ── Sample Data ───────────────────────────────────────────────────────────────
 
 SAMPLE_RESUME = """
 Alex Kim — Software Engineer
-
-Skills: Python, FastAPI, PostgreSQL, Docker, Git, basic React, REST API design.
-
+Skills: Python, FastAPI, PostgreSQL, Docker, Git, REST API design.
 Experience:
-- Built and deployed a FastAPI microservice for a small e-commerce startup (6 months).
-- Wrote SQL migrations and optimised slow queries for a PostgreSQL database.
-- Containerised services with Docker and Docker Compose.
-
-Education: BSc Computer Science, graduated 2023.
-Currently looking for a mid-level backend role in a product company.
+- Built a FastAPI microservice handling 10k req/day.
+- Optimised PostgreSQL queries, cutting p99 latency by 40%.
+- Containerised services with Docker and GitHub Actions CI.
+Education: BSc Computer Science, 2023.
 """
 
-SAMPLE_JOBS_DIR_CONTENT = {
-    "backend_engineer_stripe.txt": (
-        "Job: Backend Software Engineer @ Stripe\n"
-        "Requirements: Python (expert), distributed systems, PostgreSQL or MySQL, "
-        "REST API design, Docker/Kubernetes. Nice-to-have: Go, Kafka, AWS."
-    ),
-    "fullstack_shopify.txt": (
-        "Job: Full-Stack Engineer @ Shopify\n"
-        "Requirements: React, Node.js, Ruby on Rails, PostgreSQL, GraphQL, "
-        "strong TypeScript. Backend Python is a plus."
-    ),
-    "devops_cloudflare.txt": (
-        "Job: DevOps Engineer @ Cloudflare\n"
-        "Requirements: Kubernetes, Terraform, CI/CD pipelines, Prometheus, "
-        "Go or Python scripting, cloud (AWS/GCP)."
-    ),
-    "ml_engineer_huggingface.txt": (
-        "Job: ML Engineer @ HuggingFace\n"
-        "Requirements: Python, PyTorch, Transformers library, CUDA, MLOps, "
-        "Docker. Experience with LLM fine-tuning or deployment is a strong plus."
-    ),
-    "backend_django_startup.txt": (
-        "Job: Backend Python Engineer @ EarlyStage.io\n"
-        "Requirements: Python, Django or FastAPI, PostgreSQL, REST APIs, "
-        "Docker, basic AWS (EC2/S3). Team player in a fast-paced startup."
-    ),
-}
+SAMPLE_JOB = """
+Backend Software Engineer @ Stripe
+We build the economic infrastructure of the internet.
+Requirements: expert Python, distributed systems, PostgreSQL or MySQL at scale,
+clean REST API design, Docker/Kubernetes. Nice-to-have: Go, Kafka, AWS.
+"""
 
 
 # ============================================================
-# TODO 1: load_resume
+# TODO 1: intake_node
 # ============================================================
 
-def load_resume(source: str) -> Document:
-    """Load the resume as a single LangChain Document.
+def intake_node(state: CopilotState) -> dict:
+    """Read the job posting and desired action; return routing and extracted fields.
 
     TODO 1:
-      - If `source` is a file path that exists:
-          * If it ends with '.pdf': use PyPDFLoader(source).load() and join pages
-          * Otherwise: use TextLoader(source).load()[0]
-      - If `source` is raw text (not a path): wrap it in Document(page_content=source, metadata={"source": "pasted_resume"})
-      - Return a single Document with metadata["source"] set.
+      - structured_llm = get_llm().with_structured_output(IntakeDecision)
+      - Build a prompt:
+          system: "Extract the action, target role, and company from the user's request."
+          human: "Job posting:\n{job_posting}\n\nDesired action: {desired_action}"
+      - decision = structured_llm.invoke(...)
+      - Return {"desired_action": decision.action,
+                "target_role": decision.target_role,
+                "company": decision.company}
     """
-    raise NotImplementedError("TODO 1: implement load_resume")
+    raise NotImplementedError("TODO 1: implement intake_node")
 
 
 # ============================================================
-# TODO 2: load_job_postings
+# TODO 2: tailor_resume_node
 # ============================================================
 
-def load_job_postings(directory: str) -> List[Document]:
-    """Load all .txt job description files from a directory.
+def tailor_resume_node(state: CopilotState) -> dict:
+    """Rewrite resume bullet points to target the job description.
 
     TODO 2:
-      - Use DirectoryLoader(directory, glob="**/*.txt") to load all files.
-      - Set metadata["title"] and ["company"] from the filename
-        (e.g. "backend_engineer_stripe.txt" -> title="Backend Engineer", company="Stripe").
-      - Return the list of Documents.
+      - Call llm.invoke([SystemMessage(...), HumanMessage(...)])
+      - System: "You are a resume coach. Rewrite the bullet points to highlight
+                 experience most relevant to the job. Keep the same factual content
+                 but sharpen the language and add relevant keywords."
+      - Human: Resume:\n{resume}\n\nJob:\n{job_posting}
+      - Return {"tailored_bullets": response.content}
     """
-    raise NotImplementedError("TODO 2: implement load_job_postings")
+    raise NotImplementedError("TODO 2: implement tailor_resume_node")
 
 
 # ============================================================
-# TODO 3: chunk_documents
+# TODO 3: draft_cover_letter_node
 # ============================================================
 
-def chunk_documents(docs: List[Document], chunk_size: int = 500, chunk_overlap: int = 50) -> List[Document]:
-    """Split documents into chunks.
+def draft_cover_letter_node(state: CopilotState) -> dict:
+    """Write (or revise) a personalised cover letter.
 
     TODO 3:
-      - Create RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-      - Return splitter.split_documents(docs)
+      - If state["iteration"] > 0 and state["editor_feedback"]:
+          include a revision note asking to address the editor feedback.
+      - Call llm.invoke([SystemMessage(...), HumanMessage(...)])
+      - System: cover letter writer persona
+      - Human: Resume + Job posting + (optional revision note)
+      - Return {"cover_letter_draft": response.content,
+                "iteration": state.get("iteration", 0) + 1}
     """
-    raise NotImplementedError("TODO 3: implement chunk_documents")
+    raise NotImplementedError("TODO 3: implement draft_cover_letter_node")
 
 
 # ============================================================
-# TODO 4: build_job_vectorstore
+# TODO 4: editor_node
 # ============================================================
 
-def build_job_vectorstore(job_docs: List[Document], persist_directory: str):
-    """Embed and index job documents in Chroma.
+def editor_node(state: CopilotState) -> dict:
+    """Score the cover letter. Set approved=True if quality_score >= 0.8.
 
     TODO 4:
-      - embeddings = get_embeddings()
-      - Use Chroma.from_documents(documents=job_docs, embedding=embeddings,
-          persist_directory=persist_directory, collection_name="career_copilot_jobs")
-      - Return the Chroma instance.
+      - review_llm = get_llm(temperature=0.2).with_structured_output(EditorReview)
+      - System: strict editor persona, score 0-1, approve if >= 0.8
+      - Human: cover_letter_draft + iteration info
+      - review = review_llm.invoke(...)
+      - Return {"quality_score": review.quality_score,
+                "editor_feedback": review.feedback,
+                "approved": review.approved}
     """
-    raise NotImplementedError("TODO 4: implement build_job_vectorstore")
+    raise NotImplementedError("TODO 4: implement editor_node")
 
 
 # ============================================================
-# TODO 5: find_best_matches
+# TODO 5: mock_interview_node
 # ============================================================
 
-def find_best_matches(vectorstore, resume_text: str, k: int = 3) -> List[JobMatch]:
-    """Rank job postings by semantic similarity to the resume.
+def mock_interview_node(state: CopilotState) -> dict:
+    """Generate 5 role-specific interview questions.
 
     TODO 5:
-      - results = vectorstore.similarity_search_with_score(resume_text, k=k)
-      - For each (doc, distance): similarity = round(1 / (1 + distance) * 100, 1)
-      - Build JobMatch objects using doc.metadata for title/company
-      - Sort by similarity descending and return the list.
+      - Call llm.invoke with a prompt asking for 5 numbered behavioural +
+        technical questions tailored to the job posting and the candidate's resume.
+      - Return {"interview_questions": response.content}
     """
-    raise NotImplementedError("TODO 5: implement find_best_matches")
+    raise NotImplementedError("TODO 5: implement mock_interview_node")
 
 
 # ============================================================
-# TODO 6: analyze_skill_gap
+# TODO 6: route_after_intake
 # ============================================================
 
-def analyze_skill_gap(llm, resume_text: str, job_title: str, job_description: str) -> SkillGapAnalysis:
-    """Compare resume against one job description and return structured gap analysis.
+def route_after_intake(state: CopilotState) -> Literal["tailor_resume", "cover_letter", "mock_interview"]:
+    """Return which specialist node to route to.
 
     TODO 6:
-      - structured_llm = llm.with_structured_output(SkillGapAnalysis)
-      - Build a ChatPromptTemplate with a system message (career coach persona)
-        and a human message with resume + job details
-      - Return SkillGapAnalysis
+      - Read state["desired_action"] and return the matching literal.
+      - Default to "cover_letter" if unrecognised.
     """
-    raise NotImplementedError("TODO 6: implement analyze_skill_gap")
+    raise NotImplementedError("TODO 6: implement route_after_intake")
 
 
 # ============================================================
-# TODO 7: run_copilot_v2
+# TODO 7: route_after_editor
 # ============================================================
 
-def run_copilot_v2(resume_source: str, jobs_dir: str) -> CopilotV2Result:
-    """Orchestrate the full session-02 ingestion pipeline.
+def route_after_editor(state: CopilotState) -> Literal["revise", "approve"]:
+    """Loop back to writer or proceed to human approval.
 
     TODO 7:
-      - Load resume: resume_doc = load_resume(resume_source)
-      - Load & chunk jobs: job_docs = chunk_documents(load_job_postings(jobs_dir))
-      - Build vectorstore
-      - Find top matches
-      - Analyze gap for the top match
-      - Return CopilotV2Result
+      - If not state["approved"] AND state.get("iteration", 0) < state.get("max_iterations", 3):
+            return "revise"
+      - Else: return "approve"
     """
-    raise NotImplementedError("TODO 7: implement run_copilot_v2")
+    raise NotImplementedError("TODO 7: implement route_after_editor")
 
 
-def print_result(result: CopilotV2Result) -> None:
+# ============================================================
+# TODO 8: build_graph
+# ============================================================
+
+def build_graph():
+    """Wire the full Career Copilot LangGraph state machine.
+
+    TODO 8:
+      - from langgraph.graph import StateGraph, START, END
+      - from langgraph.checkpoint.memory import MemorySaver
+      - Create workflow = StateGraph(CopilotState)
+      - Add nodes: "intake", "tailor_resume", "draft_cover_letter",
+                   "editor", "mock_interview", "hitl_approval"
+      - Add edges:
+          START → "intake"
+          "intake" --conditional--> route_after_intake
+              {"tailor_resume": "tailor_resume",
+               "cover_letter": "draft_cover_letter",
+               "mock_interview": "mock_interview"}
+          "draft_cover_letter" → "editor"
+          "editor" --conditional--> route_after_editor
+              {"revise": "draft_cover_letter", "approve": "hitl_approval"}
+          "tailor_resume" → END
+          "mock_interview" → END
+          "hitl_approval" → END
+      - Compile with checkpointer=MemorySaver(), interrupt_before=["hitl_approval"]
+      - Return the compiled graph
+    """
+    raise NotImplementedError("TODO 8: implement build_graph")
+
+
+def run_demo():
     safe_print("=" * 60)
-    safe_print(f"Resume indexed : {result.resume_chunks} chunk(s)")
-    safe_print(f"Jobs indexed   : {result.job_count}")
-    safe_print("\nTOP JOB MATCHES")
-    for i, m in enumerate(result.top_matches, 1):
-        safe_print(f"  {i}. {m.title} @ {m.company}  ({m.similarity}% match)")
-    safe_print("\nSKILL GAP vs. Top Match")
-    safe_print(f"  Matched  : {', '.join(result.skill_gap.matched_skills)}")
-    safe_print(f"  Missing  : {', '.join(result.skill_gap.missing_skills)}")
-    safe_print(f"  Summary  : {result.skill_gap.fit_summary}")
-    safe_print("  Tips:")
-    for tip in result.skill_gap.improvement_tips:
-        safe_print(f"    - {tip}")
+    safe_print("CAREER COPILOT v4 — LangGraph Stateful Workflow Demo")
     safe_print("=" * 60)
+
+    app = build_graph()
+    config = {"configurable": {"thread_id": "demo-cover-letter"}}
+
+    initial_state: CopilotState = {
+        "resume": SAMPLE_RESUME,
+        "job_posting": SAMPLE_JOB,
+        "desired_action": "cover_letter",
+        "target_role": "",
+        "company": "",
+        "tailored_bullets": "",
+        "cover_letter_draft": "",
+        "editor_feedback": "",
+        "quality_score": 0.0,
+        "approved": False,
+        "interview_questions": "",
+        "iteration": 0,
+        "max_iterations": 3,
+        "thread_id": "demo-cover-letter",
+    }
+
+    safe_print("\n[1] Running workflow (will pause at human approval)...")
+    for event in app.stream(initial_state, config, stream_mode="values"):
+        if event.get("cover_letter_draft"):
+            safe_print(f"  Draft ready — iteration {event.get('iteration', 0)}, "
+                       f"quality {event.get('quality_score', 0):.2f}")
+
+    state = app.get_state(config)
+    if state.next:
+        safe_print(f"\n[2] Workflow paused at: {state.next}")
+        safe_print("    Simulating human approval...")
+        app.invoke(None, config)  # resume with no update = approved
+
+    final = app.get_state(config).values
+    safe_print(f"\n[3] Final cover letter (quality {final.get('quality_score', 0):.2f}):")
+    safe_print(final.get("cover_letter_draft", "(none)"))
+
+    # Quick demo of mock interview mode
+    safe_print("\n" + "=" * 60)
+    safe_print("Mock Interview mode")
+    safe_print("=" * 60)
+    config2 = {"configurable": {"thread_id": "demo-interview"}}
+    initial2 = {**initial_state, "desired_action": "mock_interview", "thread_id": "demo-interview"}
+    result2 = app.invoke(initial2, config2)
+    safe_print(result2.get("interview_questions", "(none)"))
 
 
 if __name__ == "__main__":
-    safe_print("Career Copilot — Session 02: Resume & Job Ingestion\n")
-
-    # Write sample job files to a temp dir for the demo
-    jobs_dir = tempfile.mkdtemp(prefix="cc_jobs_")
-    for fname, content in SAMPLE_JOBS_DIR_CONTENT.items():
-        Path(jobs_dir, fname).write_text(content, encoding="utf-8")
-
+    safe_print("Career Copilot — Session 04: LangGraph Workflow\n")
     try:
-        result = run_copilot_v2(SAMPLE_RESUME, jobs_dir)
-        print_result(result)
+        run_demo()
     except NotImplementedError as e:
         safe_print(f"Not implemented yet -> {e}")
         safe_print("\nComplete the TODOs above in starter.py and re-run.")
